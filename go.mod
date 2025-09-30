@@ -1,4 +1,4 @@
-module checkers-wish
+module tictactui
 
 go 1.24.0
 
