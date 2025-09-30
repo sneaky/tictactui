@@ -8,6 +8,9 @@
 *.so
 *.dylib
 
+# Project specific binaries
+tuitactoe
+
 # Test binary, built with `go test -c`
 *.test
 

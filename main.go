@@ -8,6 +8,14 @@ import (
 	lip "github.com/charmbracelet/lipgloss"
 )
 
+// Game constants
+const (
+	PlayerX = "X"
+	PlayerO = "O"
+	Draw    = "draw"
+	Empty   = ""
+)
+
 // style colors
 var (
 	winStyle    = lip.NewStyle().Foreground(lip.Color("#50FA7B")).Bold(true) // dracula green green & bold
@@ -33,12 +41,26 @@ type model struct {
 
 func initialModel() model {
 	return model{
+		currentPlayer: PlayerX,
+		board:         [][]string{{Empty, Empty, Empty}, {Empty, Empty, Empty}, {Empty, Empty, Empty}},
+	}
+}
 
-		// initial player
-		currentPlayer: "X",
+// resetGame resets the game to initial state
+func (m *model) resetGame() {
+	m.board = [][]string{{Empty, Empty, Empty}, {Empty, Empty, Empty}, {Empty, Empty, Empty}}
+	m.currentPlayer = PlayerX
+	m.winner = Empty
+	m.winningCells = nil
+	m.cursorX, m.cursorY = 0, 0
+}
 
-		// our to-do list is a grocery list
-		board: [][]string{{"", "", ""}, {"", "", ""}, {"", "", ""}},
+// switchPlayer toggles between X and O
+func (m *model) switchPlayer() {
+	if m.currentPlayer == PlayerX {
+		m.currentPlayer = PlayerO
+	} else {
+		m.currentPlayer = PlayerX
 	}
 }
 
@@ -128,22 +150,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// reset the game
 		case "r":
-			m.board = [][]string{{"", "", ""}, {"", "", ""}, {"", "", ""}}
-			m.currentPlayer = "X"
-			m.winner = ""
-			m.winningCells = nil
-			m.cursorX, m.cursorY = 0, 0
+			m.resetGame()
+			return m, tea.ClearScreen
 
 		// the "enter" and the spacebar (a literal space) toggle
 		// the selected state for the item that the cursor is pointing at.
 		case "enter", " ":
 			// ignore moves if the game is already over
-			if m.winner != "" {
+			if m.winner != Empty {
 				break
 			}
 
 			// only place on empty cells
-			if m.board[m.cursorY][m.cursorX] != "" {
+			if m.board[m.cursorY][m.cursorX] != Empty {
 				// TODO: make this flash to alert user
 				break
 			}
@@ -156,14 +175,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.winner = m.currentPlayer
 				m.winningCells = cells
 			} else if isDraw(m.board) {
-				m.winner = "draw"
+				m.winner = Draw
 			} else {
-				// swap turns
-				if m.currentPlayer == "X" {
-					m.currentPlayer = "O"
-				} else {
-					m.currentPlayer = "X"
-				}
+				m.switchPlayer()
 			}
 		}
 	}
@@ -174,100 +188,103 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func styledPlayer(player string) string {
-	if player == "X" {
-		return xStyle.Render("X")
+	if player == PlayerX {
+		return xStyle.Render(PlayerX)
 	}
-	return oStyle.Render("O")
+	return oStyle.Render(PlayerO)
+}
+
+// renderCell creates a styled cell for the game board
+func (m model) renderCell(x, y int, cell string) string {
+	// build cell content
+	var content string
+	switch cell {
+	case PlayerX:
+		content = PlayerX
+	case PlayerO:
+		content = PlayerO
+	default:
+		content = " "
+	}
+	fullCell := "[" + content + "]"
+
+	// check if this cell is part of a winning combo
+	highlight := false
+	for _, c := range m.winningCells {
+		if c.row == y && c.col == x {
+			highlight = true
+			break
+		}
+	}
+
+	// apply styles
+	if highlight {
+		return winStyle.Render(fullCell)
+	} else if m.cursorX == x && m.cursorY == y {
+		// cursor takes priority over normal colors
+		cursorStyle := lip.NewStyle().Background(lip.Color("#44475a")).Foreground(lip.Color("#f8f8f2")).Bold(true)
+		var styled lip.Style
+		switch cell {
+		case PlayerX:
+			styled = cursorStyle.Foreground(lip.Color("#8BE9FD"))
+		case PlayerO:
+			styled = cursorStyle.Foreground(lip.Color("#FF79C6"))
+		default:
+			styled = cursorStyle
+		}
+		return styled.Render(fullCell)
+	} else {
+		switch cell {
+		case PlayerX:
+			return xStyle.Render(fullCell)
+		case PlayerO:
+			return oStyle.Render(fullCell)
+		default:
+			return cellStyle.Render(fullCell)
+		}
+	}
 }
 
 func (m model) View() string {
+	// If there's a winner, show full screen ASCII art
+	switch m.winner {
+	case PlayerX:
+		return showXWinScreen()
+	case PlayerO:
+		return showOWinScreen()
+	case Draw:
+		return showDrawScreen()
+	}
+
+	// Normal game view
 	// header
 	s := "\n"
 	s += headerStyle.Render(`
   _____ _       _____           _____         
  |_   _(_)__ __|_   _|_ _ __ __|_   _|___  ___ 
-   | | | / _'___|| |/ _' / _'___|| \|/ _ \/ -_)
+   | | | / _'___|| |/ _' / _'___|| | / _ \/ -_)
    |_| |_\__|    |_|\__,_\__|    |_| \___/\___|
 `)
 	s += "\n\n"
 
-	// cursor style
-	cursorStyle := lip.NewStyle().Background(lip.Color("#44475a")).Foreground(lip.Color("#f8f8f2")).Bold(true) // dark background
-
 	for y, row := range m.board {
 		s += "\t\t"
 		for x, cell := range row {
-
-			// build cell content
-			var content string
-			switch cell {
-			case "X":
-				content = "X"
-			case "O":
-				content = "O"
-			default:
-				content = " "
-			}
-			fullCell := "[" + content + "]"
-
-			// check if this cell is part of a winning combo
-			highlight := false
-			for _, c := range m.winningCells {
-				if c.row == y && c.col == x {
-					highlight = true
-					break
-				}
-			}
-
-			// apply styles
-			if highlight {
-				fullCell = winStyle.Render(fullCell)
-			} else if m.cursorX == x && m.cursorY == y {
-				// cursor takes priority over normal colors
-				var styled lip.Style
-				switch cell {
-				case "X":
-					styled = cursorStyle.Foreground(lip.Color("#8BE9FD"))
-				case "O":
-					styled = cursorStyle.Foreground(lip.Color("#FF79C6"))
-				default:
-					styled = cursorStyle
-				}
-
-				fullCell = styled.Render(fullCell)
-			} else {
-				switch cell {
-				case "X":
-					fullCell = xStyle.Render(fullCell)
-				case "O":
-					fullCell = oStyle.Render(fullCell)
-				default:
-					fullCell = cellStyle.Render(fullCell)
-				}
-			}
-
-			s += fullCell
+			s += m.renderCell(x, y, cell)
 		}
 		s += "\n"
 	}
 
 	// footer
-	if m.winner == "draw" {
-		s += footerStyle.Render("\nIt's a draw! Press r to restart, q to quit.\n")
-	} else if m.winner != "" {
-		s += footerStyle.Render("\nWinner: ") + styledPlayer(m.winner) + "\n"
-	} else {
-		s += footerStyle.Render("\nCurrent turn: ") + styledPlayer(m.currentPlayer) + "\n"
-	}
-
+	s += footerStyle.Render("\nCurrent turn: ") + styledPlayer(m.currentPlayer) + "\n"
 	s += footerStyle.Render("\nPress r to restart, q to quit\n")
 
 	return s
 }
 
-// TODO: Use something like this as the winning screen.
-// Maybe there's a way to redraw a 'separate' view upon win condition?
-/*
+func showXWinScreen() string {
+	s := "\n\n\n"
+	s += xStyle.Render(`
 ░██    ░██    ░██       ░██ ░██
  ░██  ░██     ░██       ░██
   ░██░██      ░██  ░██  ░██ ░██░████████   ░███████
@@ -275,9 +292,15 @@ func (m model) View() string {
   ░██░██      ░██░██ ░██░██ ░██░██    ░██  ░███████
  ░██  ░██     ░████   ░████ ░██░██    ░██        ░██
 ░██    ░██    ░███     ░███ ░██░██    ░██  ░███████
-*/
+`)
+	s += "\n\n"
+	s += footerStyle.Render("Press r to restart, q to quit\n")
+	return s
+}
 
-/*
+func showOWinScreen() string {
+	s := "\n\n\n"
+	s += oStyle.Render(`
   ░██████      ░██       ░██ ░██
  ░██   ░██     ░██       ░██
 ░██     ░██    ░██  ░██  ░██ ░██░████████   ░███████
@@ -285,7 +308,27 @@ func (m model) View() string {
 ░██     ░██    ░██░██ ░██░██ ░██░██    ░██  ░███████
  ░██   ░██     ░████   ░████ ░██░██    ░██        ░██
   ░██████      ░███     ░███ ░██░██    ░██  ░█████
-*/
+`)
+	s += "\n\n"
+	s += footerStyle.Render("Press r to restart, q to quit\n")
+	return s
+}
+
+func showDrawScreen() string {
+	s := "\n\n\n"
+	s += headerStyle.Render(`
+░███████                                         
+░██   ░██                                        
+░██    ░██ ░██░████  ░██████   ░██    ░██    ░██ 
+░██    ░██ ░███           ░██  ░██    ░██    ░██ 
+░██    ░██ ░██       ░███████   ░██  ░████  ░██  
+░██   ░██  ░██      ░██   ░██    ░██░██ ░██░██   
+░███████   ░██       ░█████░██    ░███   ░███    
+`)
+	s += "\n\n"
+	s += footerStyle.Render("It's a draw! Press r to restart, q to quit\n")
+	return s
+}
 
 func main() {
 	p := tea.NewProgram(initialModel())
