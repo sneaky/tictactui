@@ -2,11 +2,30 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
+	"sync"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	lip "github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/ssh"
+	"github.com/charmbracelet/wish"
+	"github.com/charmbracelet/wish/bubbletea"
 )
+
+/*
+   TODO:
+       1: Create a matchmaking service that keeps track of:
+           a: Who is looking for a match
+           b: Assigns players to each other
+           c: Records results (wins/losses)
+       2: Extract that matchmaking service into its own package so it can be used for creating/hosting other multiplayer TUI apps
+       3: Future Ideas:
+           a: Tournament Mode: An even number of players >=4 join a Tournament Mode Server and are randomly paired up then compete tournament style
+           b: More board games! (checkers, chess, solitaire, connect-4 (this one would be VERY cool if we could figure out the dropping mechanic))
+           c: Add a web leaderboard so people can show off
+*/
 
 // Game constants
 const (
@@ -14,6 +33,15 @@ const (
 	PlayerO = "O"
 	Draw    = "draw"
 	Empty   = ""
+
+	// Board dimensions
+	BoardSize = 3
+
+	// Ticker frequency for real-time updates (100ms)
+	TickerInterval = time.Millisecond * 100
+
+	// Disconnect timeout
+	DisconnectTimeout = 5 * time.Second
 )
 
 // style colors
@@ -31,28 +59,95 @@ type coord struct {
 	col int
 }
 
+// Global session manager
+var (
+	sessionManager = &SessionManager{
+		waitingSession: nil,
+		mutex:          sync.RWMutex{},
+	}
+)
+
+type SessionManager struct {
+	waitingSession *GameSession
+	mutex          sync.RWMutex
+}
+
+type GameSession struct {
+	Board              [][]string
+	CurrentPlayer      int
+	Winner             string
+	WinningCells       []coord
+	PlayerCount        int
+	PlayerDisconnected bool
+	RestartRequested   bool
+	mutex              sync.RWMutex
+}
+
+type tickMsg time.Time
+
 type model struct {
-	board            [][]string // game board
-	cursorX, cursorY int        // which cell our cursor is currently on
-	currentPlayer    string     //"X" or "O"
-	winner           string     // "", "X", or "O"
-	winningCells     []coord    // allows us to highlight winning cells at win
+	board            [][]string   // game board
+	cursorX, cursorY int          // which cell our cursor is currently on
+	currentPlayer    string       //"X" or "O"
+	winner           string       // "", "X", or "O"
+	winningCells     []coord      // allows us to highlight winning cells at win
+	playerSymbol     string       // "X" or "O" - which player this is
+	isMyTurn         bool         // whether it's this player's turn
+	waitingForPlayer bool         // whether waiting for another player
+	gameSession      *GameSession // shared game session
+	disconnectTimer  time.Time    // when disconnect was detected
+}
+
+// createEmptyBoard creates a new empty 3x3 board
+func createEmptyBoard() [][]string {
+	board := make([][]string, BoardSize)
+	for i := range board {
+		board[i] = make([]string, BoardSize)
+		for j := range board[i] {
+			board[i][j] = Empty
+		}
+	}
+	return board
+}
+
+// copyBoard creates a deep copy of the board
+func copyBoard(board [][]string) [][]string {
+	newBoard := make([][]string, len(board))
+	for i, row := range board {
+		newBoard[i] = make([]string, len(row))
+		copy(newBoard[i], row)
+	}
+	return newBoard
 }
 
 func initialModel() model {
 	return model{
 		currentPlayer: PlayerX,
-		board:         [][]string{{Empty, Empty, Empty}, {Empty, Empty, Empty}, {Empty, Empty, Empty}},
+		board:         createEmptyBoard(),
 	}
 }
 
 // resetGame resets the game to initial state
 func (m *model) resetGame() {
-	m.board = [][]string{{Empty, Empty, Empty}, {Empty, Empty, Empty}, {Empty, Empty, Empty}}
+	m.board = createEmptyBoard()
 	m.currentPlayer = PlayerX
 	m.winner = Empty
 	m.winningCells = nil
 	m.cursorX, m.cursorY = 0, 0
+	m.isMyTurn = m.playerSymbol == m.currentPlayer
+	m.disconnectTimer = time.Time{} // Reset disconnect timer
+
+	// Reset shared session if in multiplayer mode
+	if m.gameSession != nil {
+		m.gameSession.mutex.Lock()
+		m.gameSession.Board = createEmptyBoard()
+		m.gameSession.CurrentPlayer = 0
+		m.gameSession.Winner = Empty
+		m.gameSession.WinningCells = nil
+		m.gameSession.PlayerDisconnected = false // Reset disconnect status
+		m.gameSession.RestartRequested = false   // Reset restart status
+		m.gameSession.mutex.Unlock()
+	}
 }
 
 // switchPlayer toggles between X and O
@@ -65,20 +160,25 @@ func (m *model) switchPlayer() {
 }
 
 func (m model) Init() tea.Cmd {
-	// just return 'nil', which means "no I/O right now, please."
+	// Start ticker for real-time updates if in multiplayer mode
+	if m.gameSession != nil {
+		return tea.Tick(TickerInterval, func(t time.Time) tea.Msg {
+			return tickMsg(t)
+		})
+	}
 	return nil
 }
 
 func checkWinner(board [][]string, player string) []coord {
 	// rows
-	for y := 0; y < 3; y++ {
+	for y := 0; y < BoardSize; y++ {
 		if board[y][0] == player && board[y][1] == player && board[y][2] == player {
 			return []coord{{y, 0}, {y, 1}, {y, 2}}
 		}
 	}
 
 	// cols
-	for x := 0; x < 3; x++ {
+	for x := 0; x < BoardSize; x++ {
 		if board[0][x] == player && board[1][x] == player && board[2][x] == player {
 			return []coord{{0, x}, {1, x}, {2, x}}
 		}
@@ -110,6 +210,49 @@ func isDraw(board [][]string) bool {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+
+	// Handle tick messages for real-time updates
+	case tickMsg:
+		if m.gameSession != nil {
+			// Sync with session state
+			m.gameSession.mutex.RLock()
+			m.board = copyBoard(m.gameSession.Board)
+			if m.gameSession.CurrentPlayer == 0 {
+				m.currentPlayer = PlayerX
+			} else {
+				m.currentPlayer = PlayerO
+			}
+			m.winner = m.gameSession.Winner
+			m.winningCells = m.gameSession.WinningCells
+			m.isMyTurn = m.playerSymbol == m.currentPlayer
+			m.waitingForPlayer = m.gameSession.PlayerCount < 2
+
+			// Check for restart request
+			if m.gameSession.RestartRequested {
+				// Clear screen and reset local state to match shared state
+				m.winner = m.gameSession.Winner
+				m.winningCells = m.gameSession.WinningCells
+				m.gameSession.mutex.RUnlock()
+				return m, tea.ClearScreen
+			}
+
+			// Check for disconnect
+			if m.gameSession.PlayerDisconnected {
+				if m.disconnectTimer.IsZero() {
+					m.disconnectTimer = time.Now()
+				} else if time.Since(m.disconnectTimer) > DisconnectTimeout {
+					// Disconnect timeout reached, quit the game
+					m.gameSession.mutex.RUnlock()
+					return m, tea.Quit
+				}
+			}
+			m.gameSession.mutex.RUnlock()
+		}
+
+		// Continue ticking
+		return m, tea.Tick(TickerInterval, func(t time.Time) tea.Msg {
+			return tickMsg(t)
+		})
 
 	// is it a key press?
 	case tea.KeyMsg:
@@ -151,6 +294,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// reset the game
 		case "r":
 			m.resetGame()
+			// In multiplayer, mark restart requested for other player
+			if m.gameSession != nil {
+				m.gameSession.mutex.Lock()
+				m.gameSession.RestartRequested = true
+				m.gameSession.mutex.Unlock()
+			}
 			return m, tea.ClearScreen
 
 		// the "enter" and the spacebar (a literal space) toggle
@@ -161,23 +310,50 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 
-			// only place on empty cells
-			if m.board[m.cursorY][m.cursorX] != Empty {
-				// TODO: make this flash to alert user
+			// only allow moves on your turn in multiplayer
+			if m.gameSession != nil && !m.isMyTurn {
 				break
 			}
 
-			// place the move
-			m.board[m.cursorY][m.cursorX] = m.currentPlayer
+			// only place on empty cells
+			if m.board[m.cursorY][m.cursorX] != Empty {
+				break
+			}
 
-			cells := checkWinner(m.board, m.currentPlayer)
-			if cells != nil {
-				m.winner = m.currentPlayer
-				m.winningCells = cells
-			} else if isDraw(m.board) {
-				m.winner = Draw
+			// place the move - use player's symbol, not current player
+			if m.gameSession != nil {
+				m.board[m.cursorY][m.cursorX] = m.playerSymbol
 			} else {
-				m.switchPlayer()
+				m.board[m.cursorY][m.cursorX] = m.currentPlayer
+			}
+
+			// Update shared session if in multiplayer mode
+			if m.gameSession != nil {
+				m.gameSession.mutex.Lock()
+				m.gameSession.Board[m.cursorY][m.cursorX] = m.playerSymbol
+
+				cells := checkWinner(m.gameSession.Board, m.playerSymbol)
+				if cells != nil {
+					m.gameSession.Winner = m.playerSymbol
+					m.gameSession.WinningCells = cells
+				} else if isDraw(m.gameSession.Board) {
+					m.gameSession.Winner = Draw
+				} else {
+					// Switch to next player
+					m.gameSession.CurrentPlayer = 1 - m.gameSession.CurrentPlayer
+				}
+				m.gameSession.mutex.Unlock()
+			} else {
+				// Single player mode
+				cells := checkWinner(m.board, m.currentPlayer)
+				if cells != nil {
+					m.winner = m.currentPlayer
+					m.winningCells = cells
+				} else if isDraw(m.board) {
+					m.winner = Draw
+				} else {
+					m.switchPlayer()
+				}
 			}
 		}
 	}
@@ -276,7 +452,15 @@ func (m model) View() string {
 	}
 
 	// footer
-	s += footerStyle.Render("\nCurrent turn: ") + styledPlayer(m.currentPlayer) + "\n"
+	if m.gameSession != nil && m.gameSession.PlayerDisconnected {
+		s += "\n" + lip.NewStyle().Foreground(lip.Color("#FF5555")).Bold(true).Render("⚠️  Opponent disconnected! Game will end in 5 seconds...") + "\n"
+	} else if m.waitingForPlayer {
+		s += "\n" + lip.NewStyle().Foreground(lip.Color("#FFB86C")).Bold(true).Render("Waiting for another player to join...") + "\n"
+	} else if m.isMyTurn {
+		s += footerStyle.Render("\nYour turn: ") + styledPlayer(m.currentPlayer) + "\n"
+	} else {
+		s += footerStyle.Render("\nOpponent's turn: ") + styledPlayer(m.currentPlayer) + "\n"
+	}
 	s += footerStyle.Render("\nPress r to restart, q to quit\n")
 
 	return s
@@ -330,10 +514,89 @@ func showDrawScreen() string {
 	return s
 }
 
+// SSH handler - sets up multiplayer sessions
+func handleSSHSession(s ssh.Session) (tea.Model, []tea.ProgramOption) {
+	model := initialModel()
+
+	// Set up player based on session manager
+	sessionManager.mutex.Lock()
+	if sessionManager.waitingSession == nil {
+		// First player
+		model.playerSymbol = PlayerX
+		model.isMyTurn = true
+		model.waitingForPlayer = true
+
+		// Create new session
+		sessionManager.waitingSession = &GameSession{
+			Board:         createEmptyBoard(),
+			CurrentPlayer: 0,
+			PlayerCount:   1,
+		}
+		model.gameSession = sessionManager.waitingSession
+	} else {
+		// Second player
+		model.playerSymbol = PlayerO
+		model.isMyTurn = false
+		model.waitingForPlayer = false
+
+		// Join existing session
+		sessionManager.waitingSession.PlayerCount = 2
+		model.gameSession = sessionManager.waitingSession
+		sessionManager.waitingSession = nil
+	}
+	sessionManager.mutex.Unlock()
+
+	// Set up disconnect detection
+	go func() {
+		// Simple disconnect detection - if session ends, mark as disconnected
+		<-s.Context().Done()
+		if model.gameSession != nil {
+			model.gameSession.mutex.Lock()
+			model.gameSession.PlayerDisconnected = true
+			model.gameSession.mutex.Unlock()
+		}
+	}()
+
+	return model, []tea.ProgramOption{
+		tea.WithInput(s),
+		tea.WithOutput(s),
+		tea.WithAltScreen(),
+	}
+}
+
 func main() {
-	p := tea.NewProgram(initialModel())
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("Alas, there's been an error: %v", err)
-		os.Exit(1)
+	// Check if we should run in SSH mode or standalone
+	if len(os.Args) > 1 && os.Args[1] == "ssh" {
+		// SSH server mode
+		server, err := wish.NewServer(
+			wish.WithAddress(":2222"),
+			wish.WithPublicKeyAuth(func(ctx ssh.Context, key ssh.PublicKey) bool {
+				return true // Allow all connections
+			}),
+			wish.WithPasswordAuth(func(ctx ssh.Context, password string) bool {
+				return true // Allow all connections
+			}),
+			wish.WithMiddleware(
+				bubbletea.Middleware(handleSSHSession),
+			),
+		)
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		fmt.Println("Starting SSH Tic-Tac-Toe server on :2222")
+		fmt.Println("Players can connect with: ssh -p 2222 localhost")
+		fmt.Println("Note: Using temporary host keys (more secure)")
+
+		if err := server.ListenAndServe(); err != nil {
+			log.Fatalln(err)
+		}
+	} else {
+		// Standalone mode - original working version
+		p := tea.NewProgram(initialModel())
+		if _, err := p.Run(); err != nil {
+			fmt.Printf("Alas, there's been an error: %v", err)
+			os.Exit(1)
+		}
 	}
 }
