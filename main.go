@@ -224,7 +224,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.winner = m.gameSession.Winner
 			m.winningCells = m.gameSession.WinningCells
-			m.isMyTurn = m.playerSymbol == m.currentPlayer
+			// Fix: Calculate isMyTurn directly from session state
+			m.isMyTurn = (m.gameSession.CurrentPlayer == 0 && m.playerSymbol == PlayerX) ||
+				(m.gameSession.CurrentPlayer == 1 && m.playerSymbol == PlayerO)
 			m.waitingForPlayer = m.gameSession.PlayerCount < 2
 
 			// Check for restart request
@@ -456,10 +458,8 @@ func (m model) View() string {
 		s += "\n" + lip.NewStyle().Foreground(lip.Color("#FF5555")).Bold(true).Render("⚠️  Opponent disconnected! Game will end in 5 seconds...") + "\n"
 	} else if m.waitingForPlayer {
 		s += "\n" + lip.NewStyle().Foreground(lip.Color("#FFB86C")).Bold(true).Render("Waiting for another player to join...") + "\n"
-	} else if m.isMyTurn {
-		s += footerStyle.Render("\nYour turn: ") + styledPlayer(m.currentPlayer) + "\n"
 	} else {
-		s += footerStyle.Render("\nOpponent's turn: ") + styledPlayer(m.currentPlayer) + "\n"
+		s += footerStyle.Render("\nCurrent turn: ") + styledPlayer(m.currentPlayer) + "\n"
 	}
 	s += footerStyle.Render("\nPress r to restart, q to quit\n")
 
@@ -516,6 +516,13 @@ func showDrawScreen() string {
 
 // SSH handler - sets up multiplayer sessions
 func handleSSHSession(s ssh.Session) (tea.Model, []tea.ProgramOption) {
+	// Check for PTY allocation
+	_, _, active := s.Pty()
+	if !active {
+		// If no PTY, we can't run the TUI properly
+		return model{}, []tea.ProgramOption{}
+	}
+
 	model := initialModel()
 
 	// Set up player based on session manager
@@ -534,15 +541,17 @@ func handleSSHSession(s ssh.Session) (tea.Model, []tea.ProgramOption) {
 		}
 		model.gameSession = sessionManager.waitingSession
 	} else {
-		// Second player
+		// Second player or reconnecting player
 		model.playerSymbol = PlayerO
 		model.isMyTurn = false
 		model.waitingForPlayer = false
 
-		// Join existing session
+		// Join existing session and reset disconnect state
 		sessionManager.waitingSession.PlayerCount = 2
+		sessionManager.waitingSession.PlayerDisconnected = false
+		sessionManager.waitingSession.RestartRequested = false
 		model.gameSession = sessionManager.waitingSession
-		sessionManager.waitingSession = nil
+		// Don't set waitingSession to nil - keep it for future games
 	}
 	sessionManager.mutex.Unlock()
 
@@ -568,6 +577,31 @@ func main() {
 	// Check if we should run in SSH mode or standalone
 	if len(os.Args) > 1 && os.Args[1] == "ssh" {
 		// SSH server mode
+		server, err := wish.NewServer(
+			wish.WithAddress(":2222"),
+			wish.WithPublicKeyAuth(func(ctx ssh.Context, key ssh.PublicKey) bool {
+				return true // Allow all connections
+			}),
+			wish.WithPasswordAuth(func(ctx ssh.Context, password string) bool {
+				return true // Allow all connections
+			}),
+			wish.WithMiddleware(
+				bubbletea.Middleware(handleSSHSession),
+			),
+		)
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		fmt.Println("Starting SSH Tic-Tac-Toe server on :2222")
+		fmt.Println("Players can connect with: ssh -p 2222 localhost")
+		fmt.Println("Note: Using temporary host keys (more secure)")
+
+		if err := server.ListenAndServe(); err != nil {
+			log.Fatalln(err)
+		}
+	} else if len(os.Args) > 1 && os.Args[1] == "matchmaking" {
+		// Matchmaking server mode - use EXACT same code as SSH mode
 		server, err := wish.NewServer(
 			wish.WithAddress(":2222"),
 			wish.WithPublicKeyAuth(func(ctx ssh.Context, key ssh.PublicKey) bool {
